@@ -1,13 +1,13 @@
 import base64
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-HEADERS = [
+REQUIRED_HEADERS = [
     "created_at",
     "updated_at",
     "telegram_id",
@@ -46,6 +46,7 @@ class SheetsClient:
         self.service_account_json = service_account_json
         self._gc = self._make_client()
 
+    # ---------------- auth ----------------
     def _decode_service_json(self) -> Dict[str, Any]:
         raw = (self.service_account_json or "").strip()
         if not raw:
@@ -71,25 +72,57 @@ class SheetsClient:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         return gspread.authorize(creds)
 
+    # ---------------- worksheet + schema ----------------
     def _get_ws(self):
         sh = self._gc.open_by_key(self.sheet_id)
-        if self.worksheet_name:
-            ws = sh.worksheet(self.worksheet_name)
-        else:
-            ws = sh.get_worksheet(0)
-        self._ensure_headers(ws)
+        ws = sh.worksheet(self.worksheet_name) if self.worksheet_name else sh.get_worksheet(0)
+        self._ensure_schema(ws)
         return ws
 
-    def _ensure_headers(self, ws) -> None:
-        first_row = ws.row_values(1)
-        if first_row:
-            return
-        ws.append_row(HEADERS, value_input_option="RAW")
-
-    def _header_index(self, ws) -> Dict[str, int]:
+    def _ensure_schema(self, ws) -> None:
+        """
+        1) If header row missing => write REQUIRED_HEADERS
+        2) If header row exists but missing some required columns => append missing columns to the right
+        """
         headers = ws.row_values(1)
-        return {h: i + 1 for i, h in enumerate(headers)}
 
+        # Empty sheet => create headers
+        if not headers:
+            ws.append_row(REQUIRED_HEADERS, value_input_option="RAW")
+            return
+
+        existing = [h.strip() for h in headers if h and h.strip()]
+        existing_set = set(existing)
+
+        missing = [h for h in REQUIRED_HEADERS if h not in existing_set]
+        if not missing:
+            return
+
+        # Append missing columns to the end of header row without breaking existing column alignment
+        new_headers = existing + missing
+
+        # Ensure row 1 has enough columns; update range A1:...
+        ws.update(f"A1:{self._col_letter(len(new_headers))}1", [new_headers])
+
+    def _headers(self, ws) -> List[str]:
+        headers = ws.row_values(1)
+        # Normalize (strip)
+        return [h.strip() for h in headers]
+
+    def _header_index(self, headers: List[str]) -> Dict[str, int]:
+        # 1-based for gspread
+        return {h: i + 1 for i, h in enumerate(headers) if h}
+
+    @staticmethod
+    def _col_letter(n: int) -> str:
+        # 1 -> A, 26 -> Z, 27 -> AA ...
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    # ---------------- find helpers ----------------
     def _find_row_by_email(self, ws, email: str) -> Optional[int]:
         if not email:
             return None
@@ -106,11 +139,12 @@ class SheetsClient:
         except Exception:
             return None
 
+    # ---------------- public ops ----------------
     def upsert_lead(self, lead: LeadData, now_iso: str) -> Tuple[int, str]:
-        """
-        Returns (row_number, action) where action is 'insert' or 'update'
-        """
         ws = self._get_ws()
+        headers = self._headers(ws)
+        idx = self._header_index(headers)
+
         row = self._find_row_by_email(ws, lead.email) or self._find_row_by_telegram(ws, lead.telegram_id)
 
         values_map = {
@@ -131,15 +165,19 @@ class SheetsClient:
             "course_id": "",
         }
 
+        # INSERT
         if row is None:
-            row_values = [values_map.get(h, "") for h in HEADERS]
+            row_values = [values_map.get(h, "") for h in headers]
             ws.append_row(row_values, value_input_option="RAW")
             new_row = len(ws.get_all_values())
             return new_row, "insert"
 
-        idx = self._header_index(ws)
-        # created_at не трогаем при апдейте
-        values_map["created_at"] = ws.cell(row, idx["created_at"]).value or values_map["created_at"]
+        # UPDATE (не трогаем created_at если колонка есть)
+        created_col = idx.get("created_at")
+        if created_col:
+            existing_created = (ws.cell(row, created_col).value or "").strip()
+            if existing_created:
+                values_map["created_at"] = existing_created
 
         for key, val in values_map.items():
             col = idx.get(key)
@@ -160,11 +198,13 @@ class SheetsClient:
         course_id: Optional[str],
     ) -> Optional[int]:
         ws = self._get_ws()
+        headers = self._headers(ws)
+        idx = self._header_index(headers)
+
         row = self._find_row_by_email(ws, email)
         if row is None:
             return None
 
-        idx = self._header_index(ws)
         updates = {
             "updated_at": now_iso,
             "stage": stage,
@@ -183,11 +223,13 @@ class SheetsClient:
 
     def get_telegram_id_by_email(self, email: str) -> Optional[int]:
         ws = self._get_ws()
+        headers = self._headers(ws)
+        idx = self._header_index(headers)
+
         row = self._find_row_by_email(ws, email)
         if row is None:
             return None
 
-        idx = self._header_index(ws)
         col = idx.get("telegram_id")
         if not col:
             return None
