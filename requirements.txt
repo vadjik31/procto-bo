@@ -1,4 +1,3 @@
 fastapi
-uvicorn[standard]
-gspread
-google-auth
+uvicorn
+aiogram==3.4.1
