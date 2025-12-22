@@ -41,6 +41,32 @@ sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 # ======================
 
 app = FastAPI()
+@app.get("/debug-send-test-end")
+def debug_send_test_end(token: str):
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    fake_payload = {
+        "name": "test-end",
+        "student": {"email": "debug@example.com", "name": "Debug User"},
+        "lesson": {"score": 90},
+    }
+
+    print("DEBUG SENDING PAYLOAD:", fake_payload)
+
+    score = fake_payload["lesson"]["score"]
+    result = "GREAT" if score >= GREAT_THRESHOLD else ("PASSED" if score >= PASS_THRESHOLD else "FAILED")
+
+    row = [
+        fake_payload["student"]["email"],
+        fake_payload["student"]["name"],
+        score,
+        result,
+        fake_payload["name"],
+        datetime.utcnow().isoformat()
+    ]
+    sheet.append_row(row)
+    return {"ok": True, "saved": row}
 
 
 @app.get("/")
