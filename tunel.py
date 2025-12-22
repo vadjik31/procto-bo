@@ -1,6 +1,5 @@
-import os
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -37,11 +36,9 @@ OnLeadCompleted = Callable[[LeadProfile], Awaitable[str]]
 
 class BotService:
     def __init__(self, token: str, on_lead_completed: OnLeadCompleted):
-        self.token = token
-        self.on_lead_completed = on_lead_completed
-
-        self.bot = Bot(token=self.token)
+        self.bot = Bot(token=token)
         self.dp = Dispatcher(storage=MemoryStorage())
+        self.on_lead_completed = on_lead_completed
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -51,8 +48,9 @@ class BotService:
         async def start(m: Message, state: FSMContext):
             await state.clear()
             await m.answer(
-                "Привет! Давай быстро соберём данные.\n\n"
-                "1) Напиши email, который ты будешь использовать на Skillspace:"
+                "Привет! Я помогу записаться на курс и зафиксировать результат теста.\n\n"
+                "Для начала — пару вопросов. Это займёт меньше минуты.\n\n"
+                "1/7 — Напиши email (именно тот, который будешь использовать в Skillspace):"
             )
             await state.set_state(LeadForm.email)
 
@@ -60,55 +58,49 @@ class BotService:
         async def got_email(m: Message, state: FSMContext):
             email = (m.text or "").strip()
             if "@" not in email or "." not in email:
-                await m.answer("Похоже, это не email. Введи корректный email:")
+                await m.answer("Похоже, email некорректный. Введи, пожалуйста, нормальный email:")
                 return
             await state.update_data(email=email)
-            await m.answer("2) Возраст (числом):")
+            await m.answer("2/7 — Возраст (только цифры):")
             await state.set_state(LeadForm.age)
 
         @dp.message(LeadForm.age, F.text)
         async def got_age(m: Message, state: FSMContext):
             age = (m.text or "").strip()
             if not age.isdigit():
-                await m.answer("Возраст нужен числом. Введи, пожалуйста, только цифры:")
+                await m.answer("Возраст нужен числом 🙂 Введи только цифры:")
                 return
             await state.update_data(age=age)
-            await m.answer("3) Пол (М/Ж/Другое):")
+            await m.answer("3/7 — Пол (М/Ж/Другое):")
             await state.set_state(LeadForm.gender)
 
         @dp.message(LeadForm.gender, F.text)
         async def got_gender(m: Message, state: FSMContext):
-            gender = (m.text or "").strip()
-            await state.update_data(gender=gender)
-            await m.answer("4) Страна:")
+            await state.update_data(gender=(m.text or "").strip())
+            await m.answer("4/7 — Страна:")
             await state.set_state(LeadForm.country)
 
         @dp.message(LeadForm.country, F.text)
         async def got_country(m: Message, state: FSMContext):
-            country = (m.text or "").strip()
-            await state.update_data(country=country)
-            await m.answer("5) Язык общения (например RU/EN):")
+            await state.update_data(country=(m.text or "").strip())
+            await m.answer("5/7 — Язык общения (например RU или EN):")
             await state.set_state(LeadForm.language)
 
         @dp.message(LeadForm.language, F.text)
         async def got_language(m: Message, state: FSMContext):
-            language = (m.text or "").strip()
-            await state.update_data(language=language)
-            await m.answer("6) Уровень английского (A1/A2/B1/B2/C1/C2):")
+            await state.update_data(language=(m.text or "").strip())
+            await m.answer("6/7 — Уровень английского (A1/A2/B1/B2/C1/C2):")
             await state.set_state(LeadForm.english_level)
 
         @dp.message(LeadForm.english_level, F.text)
         async def got_level(m: Message, state: FSMContext):
-            level = (m.text or "").strip()
-            await state.update_data(english_level=level)
-            await m.answer("7) Опыт с Amazon (нет/немного/продаю/другое):")
+            await state.update_data(english_level=(m.text or "").strip())
+            await m.answer("7/7 — Опыт с Amazon (нет / немного / продаю / другое):")
             await state.set_state(LeadForm.amazon_experience)
 
         @dp.message(LeadForm.amazon_experience, F.text)
         async def got_exp(m: Message, state: FSMContext):
-            exp = (m.text or "").strip()
             data = await state.get_data()
-
             profile = LeadProfile(
                 telegram_id=m.from_user.id,
                 email=data.get("email", ""),
@@ -117,16 +109,15 @@ class BotService:
                 country=data.get("country", ""),
                 language=data.get("language", ""),
                 english_level=data.get("english_level", ""),
-                amazon_experience=exp,
+                amazon_experience=(m.text or "").strip(),
             )
 
-            # callback into app (write to sheets + return message with course link)
             reply = await self.on_lead_completed(profile)
             await m.answer(reply)
             await state.clear()
 
     async def start_polling(self) -> None:
-        # IMPORTANT: if Telegram webhook was set earlier, polling will conflict.
+        # На случай если раньше ставили webhook — чтобы polling не конфликтовал.
         await self.bot.delete_webhook(drop_pending_updates=True)
         await self.dp.start_polling(self.bot)
 
