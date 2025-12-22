@@ -1,26 +1,46 @@
 import os
 import json
 from datetime import datetime
+
 from fastapi import FastAPI, Request, HTTPException
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI()
+# ======================
+# CONFIG
+# ======================
 
 PASS_THRESHOLD = int(os.getenv("PASS_THRESHOLD", 50))
 GREAT_THRESHOLD = int(os.getenv("GREAT_THRESHOLD", 80))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-# --- Google Sheets init ---
-creds_info = json.loads(SERVICE_ACCOUNT_JSON)
+if not all([WEBHOOK_SECRET, GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON]):
+    raise RuntimeError("Missing required environment variables")
+
+# ======================
+# GOOGLE SHEETS INIT
+# ======================
+
+creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
 scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+credentials = Credentials.from_service_account_info(
+    creds_info,
+    scopes=scopes
+)
+
 gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(SHEET_ID).sheet1
+sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+# ======================
+# FASTAPI
+# ======================
+
+app = FastAPI()
 
 
 @app.get("/")
@@ -30,18 +50,26 @@ def root():
 
 @app.post("/skillspace-webhook")
 async def skillspace_webhook(request: Request):
+    # --- security ---
     token = request.query_params.get("token")
     if token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
+    # --- payload ---
     payload = await request.json()
-    event_name = payload.get("name")
 
+    print("========== FULL PAYLOAD ==========")
+    print(payload)
+    print("==================================")
+
+    event_name = payload.get("name")
     print("EVENT RECEIVED:", event_name)
 
+    # интересует только завершение теста
     if event_name != "test-end":
         return {"ok": True}
 
+    # --- data extraction ---
     student = payload.get("student", {})
     lesson = payload.get("lesson", {})
 
@@ -50,9 +78,10 @@ async def skillspace_webhook(request: Request):
     score = lesson.get("score")
 
     if score is None:
-        print("NO SCORE — SKIP")
+        print("NO SCORE FOUND — SKIP")
         return {"ok": True}
 
+    # --- result logic ---
     if score < PASS_THRESHOLD:
         result = "FAILED"
     elif score < GREAT_THRESHOLD:
@@ -60,6 +89,7 @@ async def skillspace_webhook(request: Request):
     else:
         result = "GREAT"
 
+    # --- save to sheet ---
     row = [
         email,
         name,
