@@ -1,5 +1,9 @@
-fastapi
-uvicorn
-aiogram==3.4.1
-gspread
-google-auth
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+
+aiogram==3.13.1
+
+gspread==6.1.4
+google-auth==2.35.0
+
+anyio==4.6.2.post1
