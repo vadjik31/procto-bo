@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from sheets import LeadData, SheetsClient
+from skillspace import invite_student, SkillspaceError
 from tunel import BotService, LeadProfile
 
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +31,6 @@ def must_env(name: str) -> str:
 def extract_sheet_id(sheet_id_or_url: str) -> str:
     s = sheet_id_or_url.strip()
     if "docs.google.com" in s and "/d/" in s:
-        # .../spreadsheets/d/<ID>/edit
         return s.split("/d/")[1].split("/")[0]
     return s
 
@@ -45,18 +45,30 @@ def deep_get(d: Any, path: Tuple[str, ...]) -> Optional[Any]:
 
 
 def extract_skillspace_event(payload: Dict[str, Any]) -> str:
-    # Try common keys
     for k in ("event", "type", "event_name", "name"):
         v = payload.get(k)
         if isinstance(v, str) and v:
             return v
-    # Sometimes nested
     v = deep_get(payload, ("data", "event"))
     return v if isinstance(v, str) else ""
 
 
+def extract_email(payload: Dict[str, Any]) -> Optional[str]:
+    for path in (
+        ("user", "email"),
+        ("student", "email"),
+        ("data", "user", "email"),
+        ("data", "student", "email"),
+        ("email",),
+        ("data", "email"),
+    ):
+        v = deep_get(payload, path)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def extract_lesson_score(payload: Dict[str, Any]) -> Optional[float]:
-    # Most important key per your spec: lesson.score
     score = deep_get(payload, ("lesson", "score"))
     if score is None:
         score = deep_get(payload, ("data", "lesson", "score"))
@@ -68,11 +80,9 @@ def extract_lesson_score(payload: Dict[str, Any]) -> Optional[float]:
     except Exception:
         return None
 
-    # Normalize 0..1 to percent if needed
-    if 0.0 <= sc <= 1.0:
-        # Only convert if looks like fraction (e.g. 0.8)
-        if sc != 1.0:
-            sc = sc * 100.0
+    # Если пришло 0..1 — переведём в проценты (кроме ровно 1.0)
+    if 0.0 <= sc <= 1.0 and sc != 1.0:
+        sc *= 100.0
     return sc
 
 
@@ -92,37 +102,38 @@ def extract_course_id(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def extract_email(payload: Dict[str, Any]) -> Optional[str]:
-    # We rely on email to match Telegram lead with Skillspace event
-    for path in (
-        ("user", "email"),
-        ("student", "email"),
-        ("data", "user", "email"),
-        ("data", "student", "email"),
-        ("email",),
-        ("data", "email"),
-    ):
-        v = deep_get(payload, path)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
+def pretty_thresholds(pass_thr: float, great_thr: float) -> str:
+    return f"Проходной порог — {pass_thr:.0f}%, отличный результат — {great_thr:.0f}%."
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Init Sheets
+    # --- ENV ---
+    bot_token = must_env("BOT_TOKEN")
+
+    webhook_secret = must_env("SKILLSPACE_WEBHOOK_TOKEN")  # ?token=...
+    skillspace_api_key = must_env("SKILLSPACE_API_KEY")    # API ключ школы
+    skillspace_base_url = os.getenv("SKILLSPACE_BASE_URL", "https://skillspace.ru").strip()
+
+    course_url = os.getenv("SKILLSPACE_COURSE_URL", "").strip()
+    skillspace_course_id = os.getenv("SKILLSPACE_COURSE_ID", "").strip()  # для инвайта и валидации webhook
+    skillspace_group_id = os.getenv("SKILLSPACE_GROUP_ID", "").strip()
+
+    pass_thr = float(os.getenv("PASS_THRESHOLD", "50"))
+    great_thr = float(os.getenv("GREAT_THRESHOLD", "80"))
+
+    contact_username = os.getenv("CONTACT_USERNAME", "").strip()  # например @manager
+
+    # --- Sheets ---
     sheet_id = extract_sheet_id(must_env("GOOGLE_SHEET_ID"))
     ws_name = os.getenv("GOOGLE_SHEET_WORKSHEET", "").strip() or None
     sa_json = must_env("GOOGLE_SERVICE_ACCOUNT_JSON")
     sheets = SheetsClient(sheet_id=sheet_id, worksheet_name=ws_name, service_account_json=sa_json)
 
-    pass_thr = float(os.getenv("PASS_THRESHOLD", "50"))
-    great_thr = float(os.getenv("GREAT_THRESHOLD", "80"))
-    course_url = must_env("SKILLSPACE_COURSE_URL")
-
-    # Callback from bot when lead is fully collected
+    # --- Bot callback ---
     async def on_lead_completed(profile: LeadProfile) -> str:
         now = utc_iso()
+
         lead = LeadData(
             telegram_id=profile.telegram_id,
             email=profile.email,
@@ -138,28 +149,92 @@ async def lifespan(app: FastAPI):
         def _sync_upsert():
             return sheets.upsert_lead(lead, now)
 
-        row, action = await anyio.to_thread.run_sync(_sync_upsert)
+        await anyio.to_thread.run_sync(_sync_upsert)
 
-        return (
-            f"Готово ✅ (строка {row}, {action}).\n\n"
-            f"Вот доступ к курсу Skillspace:\n{course_url}\n\n"
-            "После прохождения теста/ДЗ я получу webhook и напишу тебе результат."
-        )
+        # --- Invite in Skillspace ---
+        invite_ok = False
+        invite_error = ""
 
-    # Init Bot + background polling
-    bot_token = must_env("BOT_TOKEN")
+        if skillspace_course_id:
+            try:
+                await invite_student(
+                    api_key=skillspace_api_key,
+                    email=profile.email,
+                    name=f"tg:{profile.telegram_id}",
+                    course_id=skillspace_course_id,
+                    group_id=skillspace_group_id,
+                    base_url=skillspace_base_url,
+                )
+                invite_ok = True
+
+                def _sync_stage_invited():
+                    sheets.upsert_lead(
+                        LeadData(
+                            telegram_id=profile.telegram_id,
+                            email=profile.email,
+                            age=profile.age,
+                            gender=profile.gender,
+                            country=profile.country,
+                            language=profile.language,
+                            english_level=profile.english_level,
+                            amazon_experience=profile.amazon_experience,
+                            stage="INVITED_TO_COURSE",
+                        ),
+                        now,
+                    )
+
+                await anyio.to_thread.run_sync(_sync_stage_invited)
+
+            except (SkillspaceError, Exception) as e:
+                invite_error = str(e)
+
+        # --- Message text (final, clean, human) ---
+        lines = []
+        lines.append("✅ Отлично, данные приняты.")
+        lines.append(f"📩 Email для Skillspace: {profile.email}")
+
+        if skillspace_course_id:
+            if invite_ok:
+                lines.append("🎟️ Я отправил приглашение на курс в Skillspace.")
+                lines.append("Если письма нет — проверь «Спам»/«Промоакции» и попробуй зайти по ссылке ниже под этим email.")
+            else:
+                lines.append("⚠️ Приглашение в Skillspace отправить не получилось автоматически.")
+                if contact_username:
+                    lines.append(f"Напиши {contact_username}, мы подключим тебя вручную.")
+                else:
+                    lines.append("Напиши в поддержку/менеджеру — подключим вручную.")
+                if invite_error:
+                    lines.append(f"(техническая причина: {invite_error})")
+        else:
+            lines.append("ℹ️ Авто-инвайт выключен: не задан SKILLSPACE_COURSE_ID.")
+            if contact_username:
+                lines.append(f"Если нужно — напиши {contact_username}.")
+
+        if course_url:
+            lines.append("")
+            lines.append("🔗 Ссылка на курс:")
+            lines.append(course_url)
+
+        lines.append("")
+        lines.append("Что дальше:")
+        lines.append("1) Открой курс и пройди вводный урок.")
+        lines.append("2) Сдай тест/ДЗ внутри Skillspace.")
+        lines.append(f"3) Как только придёт результат — я сразу напишу сюда. {pretty_thresholds(pass_thr, great_thr)}")
+
+        return "\n".join(lines)
+
+    # --- Init bot ---
     bot_service = BotService(token=bot_token, on_lead_completed=on_lead_completed)
 
     app.state.sheets = sheets
     app.state.bot = bot_service
     app.state.pass_thr = pass_thr
     app.state.great_thr = great_thr
-    app.state.course_id = os.getenv("SKILLSPACE_COURSE_ID", "").strip()
-    app.state.skillspace_token = must_env("SKILLSPACE_WEBHOOK_TOKEN")
+    app.state.course_id = skillspace_course_id
+    app.state.webhook_secret = webhook_secret
 
     polling_task = asyncio.create_task(bot_service.start_polling())
-
-    logger.info("App started. Bot polling running. Skillspace webhook ready.")
+    logger.info("Started. Bot polling is running. Skillspace webhook is ready.")
 
     try:
         yield
@@ -182,35 +257,35 @@ async def health():
 
 @app.post("/telegram-webhook")
 async def telegram_webhook_stub():
-    # Polling mode: webhook не используется.
-    return JSONResponse({"ok": True, "mode": "polling", "note": "telegram webhook endpoint is not used"}, status_code=200)
+    # Мы в polling. Это просто чтобы не ловить 404, если кто-то куда-то стучится.
+    return JSONResponse({"ok": True, "mode": "polling"}, status_code=200)
 
 
 @app.post("/skillspace-webhook")
 async def skillspace_webhook(request: Request, token: str):
-    if token != app.state.skillspace_token:
+    if token != app.state.webhook_secret:
         raise HTTPException(status_code=401, detail="Bad token")
 
     payload = await request.json()
     event_name = extract_skillspace_event(payload)
 
-    # We only care about test-end per your spec
+    # интересует test-end
     if event_name != "test-end":
         return {"ok": True, "ignored": True, "event": event_name}
 
+    email = extract_email(payload)
+    if not email:
+        logger.warning("Skillspace test-end received but email not found in payload")
+        return {"ok": True, "error": "email_not_found_in_payload"}
+
+    # (опционально) фильтр по курсу — если course_id приходит
+    expected_course_id = (app.state.course_id or "").strip()
     course_id = extract_course_id(payload)
-    expected_course_id = app.state.course_id
     if expected_course_id and course_id and str(course_id) != str(expected_course_id):
         return {"ok": True, "ignored": True, "reason": "course_id_mismatch", "course_id": course_id}
 
     score = extract_lesson_score(payload)
     lesson_id = extract_lesson_id(payload)
-    email = extract_email(payload)
-
-    if not email:
-        # Without email we can't match lead reliably
-        logger.warning("Skillspace test-end received but email not found in payload")
-        return {"ok": True, "error": "email_not_found_in_payload"}
 
     pass_thr = float(app.state.pass_thr)
     great_thr = float(app.state.great_thr)
@@ -223,11 +298,9 @@ async def skillspace_webhook(request: Request, token: str):
 
     now = utc_iso()
 
-    # Update sheet (sync in thread)
     def _sync_update():
         return app.state.sheets.update_from_skillspace(
             email=email,
-            telegram_id=None,
             stage=stage,
             now_iso=now,
             event_name=event_name,
@@ -236,40 +309,41 @@ async def skillspace_webhook(request: Request, token: str):
             course_id=course_id,
         )
 
-    row = await anyio.to_thread.run_sync(_sync_update)
+    await anyio.to_thread.run_sync(_sync_update)
 
-    # Notify user in Telegram if we can find telegram_id in sheet:
-    # Simplest approach: after update, we try to locate row and fetch telegram_id.
-    # For now we just attempt to find telegram_id by email using gspread find+row_values.
-    telegram_id: Optional[int] = None
-    try:
-        def _sync_get_telegram_id():
-            ws = app.state.sheets._get_ws()
-            cell = ws.find(email)
-            if not cell:
-                return None
-            row_vals = ws.row_values(cell.row)
-            # Map headers to index
-            headers = ws.row_values(1)
-            idx = {h: i for i, h in enumerate(headers)}
-            tid = row_vals[idx["telegram_id"]] if "telegram_id" in idx and idx["telegram_id"] < len(row_vals) else ""
-            return int(tid) if tid and tid.isdigit() else None
-
-        telegram_id = await anyio.to_thread.run_sync(_sync_get_telegram_id)
-    except Exception:
-        telegram_id = None
+    # notify telegram
+    telegram_id = await anyio.to_thread.run_sync(app.state.sheets.get_telegram_id_by_email, email)
 
     if telegram_id:
-        if stage == "TEST_GREAT":
-            text = f"🔥 Отлично! Тест пройден на {score:.0f}% (≥ {great_thr:.0f}%). Скоро с тобой свяжутся."
-        elif stage == "TEST_PASSED":
-            text = f"✅ Тест пройден на {score:.0f}% (≥ {pass_thr:.0f}%). Скоро с тобой свяжутся."
+        if score is None:
+            text = (
+                "✅ Результат теста получен, но балл в webhook не найден.\n"
+                "Напиши менеджеру — проверим вручную."
+            )
         else:
-            text = f"Пока не прошёл порог: результат {score:.0f}% (нужно ≥ {pass_thr:.0f}%). Попробуй ещё раз."
+            sc = score
+            if stage == "TEST_GREAT":
+                text = (
+                    f"🔥 Супер! Тест засчитан на {sc:.0f}%.\n\n"
+                    "Это сильный результат — фиксирую тебя как «отлично прошёл».\n"
+                    "Дальше с тобой свяжутся по следующим шагам."
+                )
+            elif stage == "TEST_PASSED":
+                text = (
+                    f"✅ Тест пройден на {sc:.0f}%.\n\n"
+                    "Проходной порог взят — отличная работа.\n"
+                    "Дальше с тобой свяжутся и подскажут следующий шаг."
+                )
+            else:
+                text = (
+                    f"Пока не дотянули до порога: {sc:.0f}%.\n\n"
+                    f"Нужно минимум {pass_thr:.0f}%. Попробуй ещё раз — у тебя получится.\n"
+                    "Если хочешь, могу подсказать, на какие темы обратить внимание."
+                )
 
         try:
             await app.state.bot.send_message(telegram_id, text)
         except Exception as e:
             logger.warning(f"Failed to send telegram message: {e}")
 
-    return {"ok": True, "event": event_name, "email": email, "score": score, "stage": stage, "sheet_row": row}
+    return {"ok": True, "event": event_name, "email": email, "score": score, "stage": stage}
