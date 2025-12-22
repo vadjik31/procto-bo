@@ -5,8 +5,9 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher.filters.state import State, StatesGroup
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -27,9 +28,6 @@ CONTACT_USERNAME = os.getenv("CONTACT_USERNAME", "@vadjik")
 PASS_THRESHOLD = int(os.getenv("PASS_THRESHOLD", 50))
 GREAT_THRESHOLD = int(os.getenv("GREAT_THRESHOLD", 80))
 
-if not all([BOT_TOKEN, SHEET_ID, SERVICE_ACCOUNT_JSON]):
-    raise RuntimeError("Missing env vars")
-
 # ======================
 # GOOGLE SHEETS
 # ======================
@@ -46,9 +44,74 @@ sheet = gc.open_by_key(SHEET_ID).sheet1
 # ======================
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-user_state = {}
+# ======================
+# STATES
+# ======================
+
+class Reg(StatesGroup):
+    name = State()
+    age = State()
+    country = State()
+    english = State()
+    experience = State()
+
+# ======================
+# HANDLERS
+# ======================
+
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    await Reg.name.set()
+    await message.answer("Привет! Как тебя зовут?")
+
+@dp.message_handler(state=Reg.name)
+async def step_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await Reg.age.set()
+    await message.answer("Сколько тебе лет?")
+
+@dp.message_handler(state=Reg.age)
+async def step_age(message: types.Message, state: FSMContext):
+    await state.update_data(age=message.text)
+    await Reg.country.set()
+    await message.answer("В какой ты стране?")
+
+@dp.message_handler(state=Reg.country)
+async def step_country(message: types.Message, state: FSMContext):
+    await state.update_data(country=message.text)
+    await Reg.english.set()
+    await message.answer("Уровень английского? (A1–C2)")
+
+@dp.message_handler(state=Reg.english)
+async def step_english(message: types.Message, state: FSMContext):
+    await state.update_data(english=message.text)
+    await Reg.experience.set()
+    await message.answer("Работал раньше с Amazon?")
+
+@dp.message_handler(state=Reg.experience)
+async def step_exp(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    data["experience"] = message.text
+
+    sheet.append_row([
+        message.from_user.id,
+        data["name"],
+        data["age"],
+        data["country"],
+        data["english"],
+        data["experience"],
+        "REGISTERED",
+        datetime.utcnow().isoformat()
+    ])
+
+    await message.answer(
+        f"Отлично! Вот доступ к курсу:\n{SKILLSPACE_COURSE_URL}\n\n"
+        "После выполнения всех заданий ты получишь контакт для связи."
+    )
+    await state.finish()
 
 # ======================
 # FASTAPI
@@ -56,69 +119,15 @@ user_state = {}
 
 app = FastAPI()
 
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    update = types.Update(**await request.json())
+    await dp.process_update(update)
+    return {"ok": True}
+
 @app.get("/")
 def root():
     return {"status": "ok"}
-
-# ======================
-# TELEGRAM FLOW
-# ======================
-
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    user_state[message.from_user.id] = {"stage": "name"}
-    await message.answer("Привет! Как тебя зовут?")
-
-@dp.message_handler()
-async def register_flow(message: types.Message):
-    uid = message.from_user.id
-    state = user_state.get(uid, {})
-
-    if state.get("stage") == "name":
-        state["name"] = message.text
-        state["stage"] = "age"
-        await message.answer("Сколько тебе лет?")
-        return
-
-    if state.get("stage") == "age":
-        state["age"] = message.text
-        state["stage"] = "country"
-        await message.answer("В какой ты стране?")
-        return
-
-    if state.get("stage") == "country":
-        state["country"] = message.text
-        state["stage"] = "english"
-        await message.answer("Уровень английского? (A1–C2)")
-        return
-
-    if state.get("stage") == "english":
-        state["english"] = message.text
-        state["stage"] = "experience"
-        await message.answer("Работал раньше с Amazon?")
-        return
-
-    if state.get("stage") == "experience":
-        state["experience"] = message.text
-        state["stage"] = "done"
-
-        row = [
-            uid,
-            state["name"],
-            state["age"],
-            state["country"],
-            state["english"],
-            state["experience"],
-            "REGISTERED",
-            datetime.utcnow().isoformat()
-        ]
-        sheet.append_row(row)
-
-        await message.answer(
-            f"Отлично! Вот доступ к курсу:\n{SKILLSPACE_COURSE_URL}\n\n"
-            "После выполнения всех заданий ты получишь контакт для связи."
-        )
-        return
 
 # ======================
 # SKILLSPACE WEBHOOK
@@ -134,20 +143,17 @@ async def skillspace_webhook(request: Request):
     print(payload)
 
     event = payload.get("name")
-    student = payload.get("student", {})
     lesson = payload.get("lesson", {})
+    student = payload.get("student", {})
 
     score = lesson.get("score")
-    email = student.get("email", "")
+    email = student.get("email")
 
     if event != "test-end" or score is None:
         return {"ok": True}
 
-    if score < PASS_THRESHOLD:
-        status = "FAILED"
-    elif score < GREAT_THRESHOLD:
-        status = "PASSED"
-    else:
+    status = "FAILED" if score < PASS_THRESHOLD else "PASSED"
+    if score >= GREAT_THRESHOLD:
         status = "GREAT"
 
     sheet.append_row([
@@ -159,10 +165,3 @@ async def skillspace_webhook(request: Request):
     ])
 
     return {"ok": True}
-
-# ======================
-# RUN
-# ======================
-
-if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
