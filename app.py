@@ -230,12 +230,14 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------- routes ----------------
-@app.get("/")
+# ✅ allow HEAD so free UptimeRobot checks don't get 405
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"ok": True, "service": "procto-bo", "time": utc_iso()}
 
 
-@app.get("/healthz")
+# ✅ allow HEAD so free UptimeRobot checks don't get 405
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
     return {"ok": True}
 
