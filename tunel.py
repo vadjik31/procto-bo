@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
+from aiogram.enums import ChatAction
 
 
 class LeadForm(StatesGroup):
@@ -48,9 +49,10 @@ class BotService:
         async def start(m: Message, state: FSMContext):
             await state.clear()
             await m.answer(
-                "Привет! Я помогу записаться на курс и зафиксировать результат теста.\n\n"
-                "Для начала — пару вопросов. Это займёт меньше минуты.\n\n"
-                "1/7 — Напиши email (именно тот, который будешь использовать в Skillspace):"
+                "Привет! 👋\n\n"
+                "Я помогу записаться на курс и зафиксировать результат.\n"
+                "Ответь на пару вопросов — займёт меньше минуты 🙂\n\n"
+                "1/7 — Напиши email (который будешь использовать в Skillspace):"
             )
             await state.set_state(LeadForm.email)
 
@@ -100,6 +102,14 @@ class BotService:
 
         @dp.message(LeadForm.amazon_experience, F.text)
         async def got_exp(m: Message, state: FSMContext):
+            # ✅ 1) Сразу даём “успокоительный” ответ, чтобы не было паузы
+            await m.answer("⏳ Принял(а)! Сейчас оформляю доступ к курсу… Это может занять до 1–2 минут. Пожалуйста, подождите 🙂")
+            try:
+                await self.bot.send_chat_action(m.chat.id, ChatAction.TYPING)
+            except Exception:
+                pass
+
+            # ✅ 2) Собираем профиль
             data = await state.get_data()
             profile = LeadProfile(
                 telegram_id=m.from_user.id,
@@ -112,12 +122,14 @@ class BotService:
                 amazon_experience=(m.text or "").strip(),
             )
 
+            # ✅ 3) Делаем тяжёлую часть (Sheets + Skillspace invite)
             reply = await self.on_lead_completed(profile)
+
+            # ✅ 4) Отдаём итоговое сообщение
             await m.answer(reply)
             await state.clear()
 
     async def start_polling(self) -> None:
-        # На случай если раньше ставили webhook — чтобы polling не конфликтовал.
         await self.bot.delete_webhook(drop_pending_updates=True)
         await self.dp.start_polling(self.bot)
 
