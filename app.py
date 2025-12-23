@@ -53,67 +53,14 @@ def deep_get(d: Any, path: Tuple[str, ...]) -> Optional[Any]:
     return cur
 
 
-# ---------------- Skillspace payload parsing ----------------
 def extract_skillspace_event(payload: Dict[str, Any]) -> str:
+    # purely for logging
     for k in ("event", "type", "event_name", "name"):
         v = payload.get(k)
         if isinstance(v, str) and v:
             return v
     v = deep_get(payload, ("data", "event"))
     return v if isinstance(v, str) else ""
-
-
-def extract_email(payload: Dict[str, Any]) -> Optional[str]:
-    for path in (
-        ("user", "email"),
-        ("student", "email"),
-        ("data", "user", "email"),
-        ("data", "student", "email"),
-        ("email",),
-        ("data", "email"),
-    ):
-        v = deep_get(payload, path)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-
-def extract_lesson_score(payload: Dict[str, Any]) -> Optional[float]:
-    score = deep_get(payload, ("lesson", "score"))
-    if score is None:
-        score = deep_get(payload, ("data", "lesson", "score"))
-    if score is None:
-        return None
-
-    try:
-        sc = float(score)
-    except Exception:
-        return None
-
-    # normalize 0..1 -> percent (except exactly 1.0)
-    if 0.0 <= sc <= 1.0 and sc != 1.0:
-        sc *= 100.0
-    return sc
-
-
-def extract_lesson_id(payload: Dict[str, Any]) -> Optional[str]:
-    for path in (("lesson", "id"), ("data", "lesson", "id"), ("lesson", "lesson_id")):
-        v = deep_get(payload, path)
-        if v is not None:
-            return str(v)
-    return None
-
-
-def extract_course_id(payload: Dict[str, Any]) -> Optional[str]:
-    for path in (("course", "id"), ("data", "course", "id"), ("course_id",), ("data", "course_id")):
-        v = deep_get(payload, path)
-        if v is not None:
-            return str(v)
-    return None
-
-
-def thresholds_line(pass_thr: float, great_thr: float) -> str:
-    return f"🎯 Порог: {pass_thr:.0f}%. 🔥 Отлично: {great_thr:.0f}%."
 
 
 # ---------------- app lifespan ----------------
@@ -131,10 +78,10 @@ async def lifespan(app: FastAPI):
     sheet_id = extract_sheet_id(must_env("GOOGLE_SHEET_ID"))
     sa_json = must_env("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # Optional / recommended
+    # Optional
     ws_name = os.getenv("GOOGLE_SHEET_WORKSHEET", "").strip() or None
 
-    # Skillspace API (for invite) — optional: if missing, auto-invite disabled
+    # Skillspace API for invite (if missing → auto-invite disabled)
     skillspace_api_key = os.getenv("SKILLSPACE_API_KEY", "").strip()
     skillspace_base_url = os.getenv("SKILLSPACE_BASE_URL", "https://skillspace.ru").strip()
 
@@ -142,16 +89,10 @@ async def lifespan(app: FastAPI):
     expected_course_id = os.getenv("SKILLSPACE_COURSE_ID", "").strip()
     group_id = os.getenv("SKILLSPACE_GROUP_ID", "").strip()
 
-    pass_thr = float(os.getenv("PASS_THRESHOLD", "50"))
-    great_thr = float(os.getenv("GREAT_THRESHOLD", "80"))
+    # Contact text (you set this)
+    contact_line = os.getenv("CONTACT_LINE", "").strip()
 
-    # Contact texts (easy to change via env)
-    contact_line = os.getenv("CONTACT_LINE", "").strip()  # user set this
-    fail_line = os.getenv("FAIL_LINE", "").strip()        # optional override for fail case
-    contact_tg = os.getenv("CONTACT_TG", "").strip()      # optional
-    contact_label = os.getenv("CONTACT_LABEL", "").strip()  # optional
-
-    # Create Sheets client
+    # Sheets
     sheets = SheetsClient(sheet_id=sheet_id, worksheet_name=ws_name, service_account_json=sa_json)
 
     async def on_lead_completed(profile: LeadProfile) -> str:
@@ -169,7 +110,6 @@ async def lifespan(app: FastAPI):
             stage="PROFILE_COLLECTED",
         )
 
-        # Upsert in a worker thread
         def _sync_upsert():
             return sheets.upsert_lead(lead, now)
 
@@ -217,23 +157,21 @@ async def lifespan(app: FastAPI):
             elif not skillspace_api_key:
                 invite_reason = "Не задан SKILLSPACE_API_KEY"
 
-        # Build a lively final message (includes CONTACT_LINE)
+        # ---------- YOUR FINAL MESSAGE (NO TEST CHECKS) ----------
         lines = []
-        lines.append("🎉 Супер! Данные приняты ✅")
+        lines.append("✅ Отлично, данные приняты.")
         lines.append(f"📩 Email для Skillspace: {profile.email}")
 
-        if expected_course_id and skillspace_api_key:
-            if invite_ok:
-                lines.append("🎟️ Я отправил(а) приглашение на курс в Skillspace!")
-                lines.append("Если письма не видно — проверь «Спам»/«Промоакции» и попробуй войти по ссылке ниже 😉")
-            else:
-                lines.append("⚠️ Не получилось отправить приглашение автоматически.")
-                lines.append("Ничего страшного — подключим вручную 🙌")
-                if invite_reason:
-                    lines.append(f"🔧 Причина: {invite_reason}")
+        if expected_course_id and skillspace_api_key and invite_ok:
+            lines.append("🎟️ Я отправил приглашение на курс в Skillspace.")
+            lines.append("Если письма нет — проверь «Спам»/«Промоакции» и попробуй зайти по ссылке ниже под этим email.")
+        elif expected_course_id and skillspace_api_key and not invite_ok:
+            lines.append("⚠️ Приглашение не отправилось автоматически (бывает).")
+            lines.append("Если письма нет — проверь «Спам»/«Промоакции» и попробуй зайти по ссылке ниже под этим email.")
+            if invite_reason:
+                lines.append(f"🔧 Тех. причина: {invite_reason}")
         else:
-            # Auto-invite disabled (your earlier message)
-            lines.append("ℹ️ Авто-инвайт сейчас выключен.")
+            lines.append("ℹ️ Авто-инвайт выключен (нужны SKILLSPACE_COURSE_ID и SKILLSPACE_API_KEY).")
             if invite_reason:
                 lines.append(f"🔧 Причина: {invite_reason}")
 
@@ -241,26 +179,22 @@ async def lifespan(app: FastAPI):
             lines.append("")
             lines.append("🔗 Ссылка на курс:")
             lines.append(course_url)
+            lines.append("Главное заходить с того же браузерного профиля где установлена указанная почта.")
 
         lines.append("")
-        lines.append("✅ Что дальше:")
-        lines.append("1) Пройди обучение в Skillspace 📚")
-        lines.append("2) Выполни домашние задания ✍️")
-        lines.append("3) Я получу результат по webhook и напишу сюда 🤖")
-        lines.append(thresholds_line(pass_thr, great_thr))
-
-        # Contact line (you set CONTACT_LINE) — shown in the same message
+        lines.append("Что дальше:")
+        lines.append("1.Проходи обучение.")
+        lines.append("2.Сделай домашнее задание.")
+        lines.append("3.Как сделаешь напиши по указанному телеграмму ниже.")
         if contact_line:
-            lines.append("")
             lines.append(contact_line)
-        else:
-            # fallback if CONTACT_LINE not set
-            if contact_label or contact_tg:
-                lines.append("")
-                label = contact_label or contact_tg
-                lines.append(f"💬 После полного прохождения обучения и ДЗ — напиши в Telegram: {label}")
-                if contact_tg and not label.startswith("http"):
-                    lines.append(contact_tg)
+
+        lines.append("")
+        lines.append("Важно, пиши только если просмотрел видео-уроки и выполнил домашнее задание.")
+        lines.append("")
+        lines.append('Вопросы по поводу "условий" работы ты можешь посмотреть на сайте https://procto13llcwork.work/')
+        lines.append("")
+        lines.append("А как будет выглядеть процесс работы ты сможешь узнать на курсе, не бойся , курс не длинный и достаточно интересный.")
 
         return "\n".join(lines)
 
@@ -269,24 +203,16 @@ async def lifespan(app: FastAPI):
     # Store shared state
     app.state.sheets = sheets
     app.state.bot = bot_service
-    app.state.pass_thr = pass_thr
-    app.state.great_thr = great_thr
-    app.state.expected_course_id = expected_course_id
     app.state.webhook_secret = webhook_secret
 
-    app.state.contact_line = contact_line
-    app.state.fail_line = fail_line
-    app.state.contact_tg = contact_tg
-    app.state.contact_label = contact_label
-
-    # Start polling (can be disabled via env if you ever switch to webhook)
+    # Start polling
     enable_polling = os.getenv("ENABLE_POLLING", "1").strip() == "1"
     polling_task = None
     if enable_polling:
         polling_task = asyncio.create_task(bot_service.start_polling())
-        logger.info("Started. Bot polling is running. Skillspace webhook is ready.")
+        logger.info("Started. Bot polling is running. Skillspace webhook is ready (stub mode).")
     else:
-        logger.info("Started. ENABLE_POLLING=0, polling is disabled. Skillspace webhook is ready.")
+        logger.info("Started. ENABLE_POLLING=0, polling is disabled. Skillspace webhook is ready (stub mode).")
 
     try:
         yield
@@ -322,93 +248,19 @@ async def telegram_webhook_stub():
 
 @app.post("/skillspace-webhook")
 async def skillspace_webhook(request: Request, token: str):
+    """
+    STUB endpoint:
+    Skillspace can keep sending webhooks here, but we DO NOT evaluate tests and DO NOT message user.
+    We just return 200 OK to acknowledge receipt.
+    """
     if token != app.state.webhook_secret:
         raise HTTPException(status_code=401, detail="Bad token")
 
-    payload = await request.json()
-    event_name = extract_skillspace_event(payload)
+    try:
+        payload = await request.json()
+        event_name = extract_skillspace_event(payload)
+        logger.info(f"Skillspace webhook received (ignored): event={event_name}")
+    except Exception:
+        logger.info("Skillspace webhook received (ignored): non-json payload")
 
-    # We only care about test-end
-    if event_name != "test-end":
-        return {"ok": True, "ignored": True, "event": event_name}
-
-    email = extract_email(payload)
-    if not email:
-        logger.warning("Skillspace test-end received but email not found in payload")
-        return {"ok": True, "error": "email_not_found_in_payload"}
-
-    # Optional course filter (only if payload contains course_id and expected is set)
-    expected = (app.state.expected_course_id or "").strip()
-    course_id = extract_course_id(payload)
-    if expected and course_id and str(course_id) != str(expected):
-        return {"ok": True, "ignored": True, "reason": "course_id_mismatch", "course_id": course_id}
-
-    score = extract_lesson_score(payload)
-    lesson_id = extract_lesson_id(payload)
-
-    pass_thr = float(app.state.pass_thr)
-    great_thr = float(app.state.great_thr)
-
-    stage = "TEST_FAILED"
-    if score is not None and score >= great_thr:
-        stage = "TEST_GREAT"
-    elif score is not None and score >= pass_thr:
-        stage = "TEST_PASSED"
-
-    now = utc_iso()
-
-    def _sync_update():
-        return app.state.sheets.update_from_skillspace(
-            email=email,
-            stage=stage,
-            now_iso=now,
-            event_name=event_name,
-            lesson_score=score,
-            lesson_id=lesson_id,
-            course_id=course_id,
-        )
-
-    await anyio.to_thread.run_sync(_sync_update)
-
-    # Notify user in Telegram
-    telegram_id = await anyio.to_thread.run_sync(app.state.sheets.get_telegram_id_by_email, email)
-
-    if telegram_id:
-        # Custom contact message (use FAIL_LINE first, then CONTACT_LINE)
-        contact_fallback = (app.state.fail_line or "").strip() or (app.state.contact_line or "").strip()
-        if not contact_fallback:
-            label = (app.state.contact_label or "").strip() or (app.state.contact_tg or "").strip()
-            if label:
-                contact_fallback = f"💬 После того как пройдёте обучение и выполните домашние задания — напишите: {label}"
-            else:
-                contact_fallback = "💬 После обучения и домашних заданий — напишите в наш Telegram."
-
-        if score is None:
-            text = (
-                "✅ Я получил(а) событие о завершении, но балл в webhook не нашёлся 🤔\n\n"
-                f"{contact_fallback}"
-            )
-        else:
-            sc = float(score)
-            if stage == "TEST_GREAT":
-                text = (
-                    f"🔥 Отлично! Результат теста: {sc:.0f}%\n\n"
-                    "Это очень сильный результат — красавчик(ца)! 💪\n"
-                    "Дальше с вами свяжутся по следующим шагам 🙌"
-                )
-            elif stage == "TEST_PASSED":
-                text = (
-                    f"✅ Тест пройден! Результат: {sc:.0f}%\n\n"
-                    "Проходной порог взят — супер! 🎯\n"
-                    "Дальше с вами свяжутся и подскажут следующий шаг 🙌"
-                )
-            else:
-                # Instead of “не дотянули...” — your contact instruction
-                text = contact_fallback
-
-        try:
-            await app.state.bot.send_message(telegram_id, text)
-        except Exception as e:
-            logger.warning(f"Failed to send telegram message: {e}")
-
-    return {"ok": True, "event": event_name, "email": email, "score": score, "stage": stage, "lesson_id": lesson_id}
+    return {"ok": True, "ignored": True}
